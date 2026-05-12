@@ -356,6 +356,75 @@ namespace uc
     }
 
     template <typename RetSpec, typename... ArgSpecs>
+    struct abi
+    {
+        using ret_t = typename RetSpec::type;
+
+        using invoker_t = ret_t(UC_CDECL*)(
+            std::uintptr_t target,
+            typename ArgSpecs::type...
+        );
+
+        using callback_fn_t = ret_t(UC_CDECL*)(
+            typename ArgSpecs::type...
+        );
+
+        using function_t = function<
+            cleanup::caller,
+            RetSpec,
+            ArgSpecs...
+        >;
+
+        using function_callee_t = function<
+            cleanup::callee,
+            RetSpec,
+            ArgSpecs...
+        >;
+
+        using callback_t = callback<
+            cleanup::caller,
+            RetSpec,
+            ArgSpecs...
+        >;
+
+        using callback_callee_t = callback<
+            cleanup::callee,
+            RetSpec,
+            ArgSpecs...
+        >;
+
+        static function_t make(std::uintptr_t target)
+        {
+            return uc::make<RetSpec, ArgSpecs...>(target);
+        }
+
+        static function_callee_t make_callee(std::uintptr_t target)
+        {
+            return uc::make_callee<RetSpec, ArgSpecs...>(target);
+        }
+
+        static invoker_t make_invoker()
+        {
+            return detail::invoker_cache<cleanup::caller, RetSpec, ArgSpecs...>::get();
+        }
+
+        static invoker_t make_invoker_callee()
+        {
+            return detail::invoker_cache<cleanup::callee, RetSpec, ArgSpecs...>::get();
+        }
+
+        static callback_t make_callback(callback_fn_t fn)
+        {
+            return uc::make_callback<RetSpec, ArgSpecs...>(fn);
+        }
+
+        static callback_callee_t make_callback_callee(callback_fn_t fn)
+        {
+            return uc::make_callback_callee<RetSpec, ArgSpecs...>(fn);
+        }
+    };
+
+    template <typename RetSpec, typename... ArgSpecs>
     auto make_invoker()
     {
         return detail::invoker_cache<cleanup::caller, RetSpec, ArgSpecs...>::get();
