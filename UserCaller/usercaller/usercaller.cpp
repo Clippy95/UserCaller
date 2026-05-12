@@ -14,7 +14,6 @@ namespace uc::detail
 {
     namespace
     {
-        constexpr std::size_t CodeScratchBytes = 4096;
         constexpr std::size_t CodePageBytes = 64 * 1024;
         constexpr std::size_t CodeAlignBytes = 16;
 
@@ -522,14 +521,14 @@ namespace uc::detail
 
         void* build_code(const abi_desc& desc, std::uintptr_t baked_target)
         {
-            Xbyak::CodeGenerator code(CodeScratchBytes);
+            Xbyak::CodeGenerator code(4096, Xbyak::AutoGrow);
             emit_thunk_body(code, desc, baked_target);
             return finalize_code(code);
         }
 
         void* build_callback_code(const abi_desc& desc, std::uintptr_t callback_addr)
         {
-            Xbyak::CodeGenerator code(CodeScratchBytes);
+            Xbyak::CodeGenerator code(4096, Xbyak::AutoGrow);
             emit_callback_body(code, desc, callback_addr);
             return finalize_code(code);
         }
