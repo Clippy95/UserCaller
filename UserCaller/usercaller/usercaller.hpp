@@ -28,6 +28,14 @@ namespace uc
         edx,
         esi,
         edi,
+        xmm0,
+        xmm1,
+        xmm2,
+        xmm3,
+        xmm4,
+        xmm5,
+        xmm6,
+        xmm7,
 
         st0,
     };
@@ -71,6 +79,7 @@ namespace uc
     };
 
     template <typename T> using eax_ret = ret<loc::eax, T>;
+    template <typename T> using xmm0_ret = ret<loc::xmm0, T>;
     template <typename T> using void_ret = ret<loc::none, T>;
     template <typename T> using st0_ret = ret<loc::st0, T>;
     template <typename T> using edx_eax_ret = ret64<loc_pair::edx_eax, T>;
@@ -81,6 +90,14 @@ namespace uc
     template <typename T> using edx_arg = arg<loc::edx, T>;
     template <typename T> using esi_arg = arg<loc::esi, T>;
     template <typename T> using edi_arg = arg<loc::edi, T>;
+    template <typename T> using xmm0_arg = arg<loc::xmm0, T>;
+    template <typename T> using xmm1_arg = arg<loc::xmm1, T>;
+    template <typename T> using xmm2_arg = arg<loc::xmm2, T>;
+    template <typename T> using xmm3_arg = arg<loc::xmm3, T>;
+    template <typename T> using xmm4_arg = arg<loc::xmm4, T>;
+    template <typename T> using xmm5_arg = arg<loc::xmm5, T>;
+    template <typename T> using xmm6_arg = arg<loc::xmm6, T>;
+    template <typename T> using xmm7_arg = arg<loc::xmm7, T>;
     template <typename T> using stack_arg = arg<loc::stack, T>;
 
     namespace detail
@@ -154,7 +171,24 @@ namespace uc
                     w == loc::esi ||
                     w == loc::edi;
 
-                return is_gpr && sizeof(T) <= 4;
+                if constexpr (is_gpr)
+                {
+                    return sizeof(T) <= 4;
+                }
+                else
+                {
+                    constexpr bool is_xmm =
+                        w == loc::xmm0 ||
+                        w == loc::xmm1 ||
+                        w == loc::xmm2 ||
+                        w == loc::xmm3 ||
+                        w == loc::xmm4 ||
+                        w == loc::xmm5 ||
+                        w == loc::xmm6 ||
+                        w == loc::xmm7;
+
+                    return is_xmm && (std::is_same_v<T, float> || std::is_same_v<T, double>);
+                }
             }
         }
 
@@ -184,6 +218,10 @@ namespace uc
                 {
                     return std::is_same_v<T, float> || std::is_same_v<T, double>;
                 }
+                else if constexpr (RetSpec::where == loc::xmm0)
+                {
+                    return std::is_same_v<T, float> || std::is_same_v<T, double>;
+                }
                 else
                 {
                     return false;
@@ -206,14 +244,22 @@ namespace uc
                 count_arg_loc<loc::ecx, ArgSpecs...>() <= 1 &&
                 count_arg_loc<loc::edx, ArgSpecs...>() <= 1 &&
                 count_arg_loc<loc::esi, ArgSpecs...>() <= 1 &&
-                count_arg_loc<loc::edi, ArgSpecs...>() <= 1;
+                count_arg_loc<loc::edi, ArgSpecs...>() <= 1 &&
+                count_arg_loc<loc::xmm0, ArgSpecs...>() <= 1 &&
+                count_arg_loc<loc::xmm1, ArgSpecs...>() <= 1 &&
+                count_arg_loc<loc::xmm2, ArgSpecs...>() <= 1 &&
+                count_arg_loc<loc::xmm3, ArgSpecs...>() <= 1 &&
+                count_arg_loc<loc::xmm4, ArgSpecs...>() <= 1 &&
+                count_arg_loc<loc::xmm5, ArgSpecs...>() <= 1 &&
+                count_arg_loc<loc::xmm6, ArgSpecs...>() <= 1 &&
+                count_arg_loc<loc::xmm7, ArgSpecs...>() <= 1;
         }
 
         template <cleanup CleanupMode, bool RuntimeTarget, typename RetSpec, typename... ArgSpecs>
         abi_desc make_desc()
         {
-            static_assert(valid_ret<RetSpec>(), "Only void return, <=4-byte eax return, st0 float/double return, or edx:eax int64 return is supported for now.");
-            static_assert((valid_arg<ArgSpecs>() && ...), "Invalid arg. Register args must be <=4 bytes. Stack args may be <=8 bytes.");
+            static_assert(valid_ret<RetSpec>(), "Only void return, <=4-byte eax return, st0/xmm0 float/double return, or edx:eax int64 return is supported for now.");
+            static_assert((valid_arg<ArgSpecs>() && ...), "Invalid arg. GPR args must be <=4 bytes. XMM args must be float/double. Stack args may be <=8 bytes.");
 
             static_assert(
                 no_duplicate_register_args<ArgSpecs...>(),

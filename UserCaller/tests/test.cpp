@@ -41,6 +41,7 @@ void print_pass(const char* name, bool ok)
 
 extern "C" float g_uc_float_value = 12.5f;
 extern "C" double g_uc_double_value = 123.25;
+extern "C" float g_uc_sse_callback_scale = 3.0f;
 
 // int __usercall Target_Eax_Eax@<eax>(int value@<eax>);
 extern "C" __declspec(naked) int Target_Eax_Eax()
@@ -59,6 +60,49 @@ extern "C" __declspec(naked) int Target_Edx_Eax()
     {
         mov eax, edx
         shl eax, 1
+        ret
+    }
+}
+
+// float __usercall Target_Xmm1_Xmm0@<xmm0>(float value@<xmm1>);
+extern "C" __declspec(naked) float Target_Xmm1_Xmm0()
+{
+    __asm
+    {
+        addss xmm1, xmm1
+        movss xmm0, xmm1
+        ret
+    }
+}
+
+// double __usercall Target_Xmm2_Xmm0_Double@<xmm0>(double value@<xmm2>);
+extern "C" __declspec(naked) double Target_Xmm2_Xmm0_Double()
+{
+    __asm
+    {
+        addsd xmm2, xmm2
+        movsd xmm0, xmm2
+        ret
+    }
+}
+
+float __cdecl Callback_Xmm1_Xmm0(float value)
+{
+    return value * g_uc_sse_callback_scale;
+}
+
+extern "C" __declspec(naked) float Call_Xmm1_Ret_Xmm0(void* fn, float value)
+{
+    __asm
+    {
+        mov eax, [esp + 4]
+        movss xmm1, dword ptr [esp + 8]
+        call eax
+
+        sub esp, 4
+        movss dword ptr [esp], xmm0
+        fld dword ptr [esp]
+        add esp, 4
         ret
     }
 }
@@ -477,6 +521,60 @@ int main()
 
         int result = fn(7);
         std::cout << "edx arg/eax ret: " << result << " expected 14\n\n";
+    }
+
+    {
+        auto target = addr_of(&Target_Xmm1_Xmm0);
+
+        static auto fn = uc::make<
+            uc::xmm0_ret<float>,
+            uc::xmm1_arg<float>
+        >(target);
+
+        print_addr("Target_Xmm1_Xmm0", target);
+        print_addr("UserCaller thunk", addr_of(fn.raw()));
+
+        float result = fn(7.0f);
+        bool ok = std::fabs(result - 14.0f) < 0.001f;
+
+        std::cout << "xmm1 arg/xmm0 ret float: " << result << " expected 14\n";
+        print_pass("xmm float test", ok);
+        std::cout << '\n';
+    }
+
+    {
+        auto target = addr_of(&Target_Xmm2_Xmm0_Double);
+
+        static auto fn = uc::make<
+            uc::xmm0_ret<double>,
+            uc::xmm2_arg<double>
+        >(target);
+
+        print_addr("Target_Xmm2_Xmm0_Double", target);
+        print_addr("UserCaller thunk", addr_of(fn.raw()));
+
+        double result = fn(3.5);
+        bool ok = std::fabs(result - 7.0) < 0.000001;
+
+        std::cout << "xmm2 arg/xmm0 ret double: " << result << " expected 7\n";
+        print_pass("xmm double test", ok);
+        std::cout << '\n';
+    }
+
+    {
+        static auto cb = uc::make_callback<
+            uc::xmm0_ret<float>,
+            uc::xmm1_arg<float>
+        >(&Callback_Xmm1_Xmm0);
+
+        print_addr("UserCaller SSE callback", cb.address());
+
+        float result = Call_Xmm1_Ret_Xmm0(cb.raw(), 5.0f);
+        bool ok = std::fabs(result - 15.0f) < 0.001f;
+
+        std::cout << "xmm callback float: " << result << " expected 15\n";
+        print_pass("xmm callback test", ok);
+        std::cout << '\n';
     }
 
 #if defined(UC_WITH_SAFETYHOOK)

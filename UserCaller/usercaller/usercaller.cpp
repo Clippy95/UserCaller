@@ -50,6 +50,38 @@ namespace uc::detail
             }
         }
 
+        bool is_xmm_loc(loc where)
+        {
+            return
+                where == loc::xmm0 ||
+                where == loc::xmm1 ||
+                where == loc::xmm2 ||
+                where == loc::xmm3 ||
+                where == loc::xmm4 ||
+                where == loc::xmm5 ||
+                where == loc::xmm6 ||
+                where == loc::xmm7;
+        }
+
+        asmjit::x86::Vec xmm_from_loc(loc where)
+        {
+            using namespace asmjit;
+
+            switch (where)
+            {
+            case loc::xmm0: return x86::xmm0;
+            case loc::xmm1: return x86::xmm1;
+            case loc::xmm2: return x86::xmm2;
+            case loc::xmm3: return x86::xmm3;
+            case loc::xmm4: return x86::xmm4;
+            case loc::xmm5: return x86::xmm5;
+            case loc::xmm6: return x86::xmm6;
+            case loc::xmm7: return x86::xmm7;
+            default:
+                throw std::runtime_error("UserCaller: invalid xmm register location.");
+            }
+        }
+
         bool uses_register(const abi_desc& desc, loc reg)
         {
             for (const auto& arg : desc.args)
@@ -160,6 +192,115 @@ namespace uc::detail
             throw std::runtime_error("UserCaller: unsupported stack arg size.");
         }
 
+        void emit_load_xmm_arg(
+            asmjit::x86::Assembler& a,
+            loc where,
+            std::uint32_t wrapper_offset,
+            std::uint32_t bytes
+        )
+        {
+            using namespace asmjit;
+
+            const auto xmm = xmm_from_loc(where);
+
+            if (bytes == 4)
+            {
+                a.movss(xmm, x86::dword_ptr(x86::ebp, static_cast<int>(wrapper_offset)));
+                return;
+            }
+
+            if (bytes == 8)
+            {
+                a.movsd(xmm, x86::qword_ptr(x86::ebp, static_cast<int>(wrapper_offset)));
+                return;
+            }
+
+            throw std::runtime_error("UserCaller: unsupported xmm arg size.");
+        }
+
+        void emit_store_xmm_arg_on_stack(
+            asmjit::x86::Assembler& a,
+            loc where,
+            std::uint32_t bytes
+        )
+        {
+            using namespace asmjit;
+
+            const auto xmm = xmm_from_loc(where);
+
+            if (bytes == 4)
+            {
+                a.sub(x86::esp, 4);
+                a.movss(x86::dword_ptr(x86::esp), xmm);
+                return;
+            }
+
+            if (bytes == 8)
+            {
+                a.sub(x86::esp, 8);
+                a.movsd(x86::qword_ptr(x86::esp), xmm);
+                return;
+            }
+
+            throw std::runtime_error("UserCaller: unsupported xmm callback arg size.");
+        }
+
+        void emit_bridge_xmm0_to_st0(
+            asmjit::x86::Assembler& a,
+            std::uint32_t bytes
+        )
+        {
+            using namespace asmjit;
+
+            if (bytes == 4)
+            {
+                a.sub(x86::esp, 4);
+                a.movss(x86::dword_ptr(x86::esp), x86::xmm0);
+                a.fld(x86::dword_ptr(x86::esp));
+                a.add(x86::esp, 4);
+                return;
+            }
+
+            if (bytes == 8)
+            {
+                a.sub(x86::esp, 8);
+                a.movsd(x86::qword_ptr(x86::esp), x86::xmm0);
+                a.fld(x86::qword_ptr(x86::esp));
+                a.add(x86::esp, 8);
+                return;
+            }
+
+            throw std::runtime_error("UserCaller: unsupported xmm0 return size.");
+        }
+
+        void emit_bridge_st0_to_xmm0(
+            asmjit::x86::Assembler& a,
+            std::uint32_t bytes
+        )
+        {
+            using namespace asmjit;
+
+            if (bytes == 4)
+            {
+                a.sub(x86::esp, 4);
+                a.fstp(x86::dword_ptr(x86::esp));
+                a.movss(x86::xmm0, x86::dword_ptr(x86::esp));
+                a.add(x86::esp, 4);
+                return;
+            }
+
+            if (bytes == 8)
+            {
+                a.sub(x86::esp, 8);
+                a.fstp(x86::qword_ptr(x86::esp));
+                a.movsd(x86::xmm0, x86::qword_ptr(x86::esp));
+                a.add(x86::esp, 8);
+                return;
+            }
+
+            throw std::runtime_error("UserCaller: unsupported st0 return size for xmm0 bridge.");
+        }
+
         void emit_push_callback_arg(
             asmjit::x86::Assembler& a,
             const abi_desc& desc,
@@ -192,8 +333,14 @@ namespace uc::detail
                 throw std::runtime_error("UserCaller: unsupported callback stack arg size.");
             }
 
+            if (is_xmm_loc(arg.where))
+            {
+                emit_store_xmm_arg_on_stack(a, arg.where, arg.bytes);
+                return;
+            }
+
             if (arg.bytes != 4)
-                throw std::runtime_error("UserCaller: callback register args must be 4 bytes in this version.");
+                throw std::runtime_error("UserCaller: callback GPR args must be 4 bytes in this version.");
 
             a.push(gp_from_loc(arg.where));
         }
@@ -257,8 +404,14 @@ namespace uc::detail
                 if (arg.where == loc::stack)
                     continue;
 
+                if (is_xmm_loc(arg.where))
+                {
+                    emit_load_xmm_arg(a, arg.where, offsets[i], arg.bytes);
+                    continue;
+                }
+
                 if (arg.bytes != 4)
-                    throw std::runtime_error("UserCaller: register args must be 4 bytes in this version.");
+                    throw std::runtime_error("UserCaller: GPR args must be 4 bytes in this version.");
 
                 a.mov(
                     gp_from_loc(arg.where),
@@ -293,6 +446,9 @@ namespace uc::detail
 
             if (preserve_ebx)
                 a.pop(x86::ebx);
+
+            if (desc.return_where == loc::xmm0)
+                emit_bridge_xmm0_to_st0(a, desc.return_bytes);
 
             // Removes baked local slot too, if it exists.
             a.mov(x86::esp, x86::ebp);
@@ -335,6 +491,9 @@ namespace uc::detail
 
             if (cb_bytes != 0)
                 a.add(x86::esp, cb_bytes);
+
+            if (desc.return_where == loc::xmm0)
+                emit_bridge_st0_to_xmm0(a, desc.return_bytes);
 
             // Preserve eax / edx:eax / st0 return naturally.
             a.mov(x86::esp, x86::ebp);
