@@ -2,8 +2,11 @@
 
 #include <Windows.h>
 
-#include <asmjit/x86.h>
+#include <xbyak.h>
 
+#include <algorithm>
+#include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -11,11 +14,46 @@ namespace uc::detail
 {
     namespace
     {
-        asmjit::JitRuntime& runtime()
+        constexpr std::size_t CodeScratchBytes = 4096;
+        constexpr std::size_t CodePageBytes = 64 * 1024;
+        constexpr std::size_t CodeAlignBytes = 16;
+
+        struct executable_page
         {
-            static asmjit::JitRuntime rt;
-            return rt;
-        }
+            executable_page()
+                : base(static_cast<std::uint8_t*>(
+                    VirtualAlloc(nullptr, CodePageBytes, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+                ))
+            {
+                if (!base)
+                    throw std::runtime_error("UserCaller: VirtualAlloc failed for executable code page.");
+            }
+
+            ~executable_page()
+            {
+                if (base)
+                    VirtualFree(base, 0, MEM_RELEASE);
+            }
+
+            executable_page(const executable_page&) = delete;
+            executable_page& operator=(const executable_page&) = delete;
+
+            std::uint8_t* allocate(std::size_t bytes)
+            {
+                const std::size_t aligned_offset =
+                    (used + CodeAlignBytes - 1) & ~(CodeAlignBytes - 1);
+
+                if (aligned_offset + bytes > CodePageBytes)
+                    return nullptr;
+
+                std::uint8_t* out = base + aligned_offset;
+                used = aligned_offset + bytes;
+                return out;
+            }
+
+            std::uint8_t* base{};
+            std::size_t used{};
+        };
 
         std::mutex& runtime_mutex()
         {
@@ -23,28 +61,44 @@ namespace uc::detail
             return mtx;
         }
 
-        [[noreturn]] void throw_asmjit_error(const char* what, asmjit::Error err)
+        std::vector<std::unique_ptr<executable_page>>& code_pages()
         {
-            throw std::runtime_error(
-                std::string("UserCaller: ") +
-                what +
-                ": " +
-                asmjit::DebugUtils::error_as_string(err)
-            );
+            static std::vector<std::unique_ptr<executable_page>> pages;
+            return pages;
         }
 
-        asmjit::x86::Gp gp_from_loc(loc where)
+        void* allocate_code(std::size_t bytes)
         {
-            using namespace asmjit;
+            std::lock_guard<std::mutex> lock(runtime_mutex());
+
+            for (const auto& page : code_pages())
+            {
+                if (void* p = page->allocate(bytes))
+                    return p;
+            }
+
+            auto page = std::make_unique<executable_page>();
+            void* p = page->allocate(bytes);
+
+            if (!p)
+                throw std::runtime_error("UserCaller: generated code is larger than one executable code page.");
+
+            code_pages().push_back(std::move(page));
+            return p;
+        }
+
+        Xbyak::Reg32 gp_from_loc(loc where)
+        {
+            using namespace Xbyak::util;
 
             switch (where)
             {
-            case loc::eax: return x86::eax;
-            case loc::ebx: return x86::ebx;
-            case loc::ecx: return x86::ecx;
-            case loc::edx: return x86::edx;
-            case loc::esi: return x86::esi;
-            case loc::edi: return x86::edi;
+            case loc::eax: return eax;
+            case loc::ebx: return ebx;
+            case loc::ecx: return ecx;
+            case loc::edx: return edx;
+            case loc::esi: return esi;
+            case loc::edi: return edi;
             default:
                 throw std::runtime_error("UserCaller: invalid register location.");
             }
@@ -63,20 +117,20 @@ namespace uc::detail
                 where == loc::xmm7;
         }
 
-        asmjit::x86::Vec xmm_from_loc(loc where)
+        Xbyak::Xmm xmm_from_loc(loc where)
         {
-            using namespace asmjit;
+            using namespace Xbyak::util;
 
             switch (where)
             {
-            case loc::xmm0: return x86::xmm0;
-            case loc::xmm1: return x86::xmm1;
-            case loc::xmm2: return x86::xmm2;
-            case loc::xmm3: return x86::xmm3;
-            case loc::xmm4: return x86::xmm4;
-            case loc::xmm5: return x86::xmm5;
-            case loc::xmm6: return x86::xmm6;
-            case loc::xmm7: return x86::xmm7;
+            case loc::xmm0: return xmm0;
+            case loc::xmm1: return xmm1;
+            case loc::xmm2: return xmm2;
+            case loc::xmm3: return xmm3;
+            case loc::xmm4: return xmm4;
+            case loc::xmm5: return xmm5;
+            case loc::xmm6: return xmm6;
+            case loc::xmm7: return xmm7;
             default:
                 throw std::runtime_error("UserCaller: invalid xmm register location.");
             }
@@ -111,12 +165,6 @@ namespace uc::detail
             std::vector<std::uint32_t> offsets;
             offsets.reserve(desc.args.size());
 
-            // Baked wrapper:
-            // [ebp + 8] = arg0
-            //
-            // Runtime invoker:
-            // [ebp + 8]  = target
-            // [ebp + 12] = arg0
             std::uint32_t offset = desc.runtime_target ? 12u : 8u;
 
             for (const auto& arg : desc.args)
@@ -131,11 +179,6 @@ namespace uc::detail
         std::vector<std::uint32_t> incoming_stack_arg_offsets(const abi_desc& desc)
         {
             std::vector<std::uint32_t> offsets(desc.args.size(), 0);
-
-            // At callback-stub entry:
-            //
-            // [ebp + 4] = return address
-            // [ebp + 8] = first incoming stack arg
             std::uint32_t offset = 8;
 
             for (std::size_t i = 0; i < desc.args.size(); ++i)
@@ -163,29 +206,22 @@ namespace uc::detail
         }
 
         void emit_push_stack_arg(
-            asmjit::x86::Assembler& a,
+            Xbyak::CodeGenerator& c,
             const arg_desc& arg,
             std::uint32_t wrapper_offset)
         {
-            using namespace asmjit;
+            using namespace Xbyak::util;
 
             if (arg.bytes == 4)
             {
-                a.push(x86::dword_ptr(x86::ebp, static_cast<int>(wrapper_offset)));
+                c.push(dword[ebp + static_cast<int>(wrapper_offset)]);
                 return;
             }
 
             if (arg.bytes == 8)
             {
-                // x86 stack is little-endian.
-                // For an 8-byte argument at [ebp+offset]:
-                //
-                // low32  = [ebp+offset]
-                // high32 = [ebp+offset+4]
-                //
-                // To place it correctly for the callee, push high then low.
-                a.push(x86::dword_ptr(x86::ebp, static_cast<int>(wrapper_offset + 4)));
-                a.push(x86::dword_ptr(x86::ebp, static_cast<int>(wrapper_offset)));
+                c.push(dword[ebp + static_cast<int>(wrapper_offset + 4)]);
+                c.push(dword[ebp + static_cast<int>(wrapper_offset)]);
                 return;
             }
 
@@ -193,25 +229,25 @@ namespace uc::detail
         }
 
         void emit_load_xmm_arg(
-            asmjit::x86::Assembler& a,
+            Xbyak::CodeGenerator& c,
             loc where,
             std::uint32_t wrapper_offset,
             std::uint32_t bytes
         )
         {
-            using namespace asmjit;
+            using namespace Xbyak::util;
 
             const auto xmm = xmm_from_loc(where);
 
             if (bytes == 4)
             {
-                a.movss(xmm, x86::dword_ptr(x86::ebp, static_cast<int>(wrapper_offset)));
+                c.movss(xmm, dword[ebp + static_cast<int>(wrapper_offset)]);
                 return;
             }
 
             if (bytes == 8)
             {
-                a.movsd(xmm, x86::qword_ptr(x86::ebp, static_cast<int>(wrapper_offset)));
+                c.movsd(xmm, qword[ebp + static_cast<int>(wrapper_offset)]);
                 return;
             }
 
@@ -219,82 +255,76 @@ namespace uc::detail
         }
 
         void emit_store_xmm_arg_on_stack(
-            asmjit::x86::Assembler& a,
+            Xbyak::CodeGenerator& c,
             loc where,
             std::uint32_t bytes
         )
         {
-            using namespace asmjit;
+            using namespace Xbyak::util;
 
             const auto xmm = xmm_from_loc(where);
 
             if (bytes == 4)
             {
-                a.sub(x86::esp, 4);
-                a.movss(x86::dword_ptr(x86::esp), xmm);
+                c.sub(esp, 4);
+                c.movss(dword[esp], xmm);
                 return;
             }
 
             if (bytes == 8)
             {
-                a.sub(x86::esp, 8);
-                a.movsd(x86::qword_ptr(x86::esp), xmm);
+                c.sub(esp, 8);
+                c.movsd(qword[esp], xmm);
                 return;
             }
 
             throw std::runtime_error("UserCaller: unsupported xmm callback arg size.");
         }
 
-        void emit_bridge_xmm0_to_st0(
-            asmjit::x86::Assembler& a,
-            std::uint32_t bytes
-        )
+        void emit_bridge_xmm0_to_st0(Xbyak::CodeGenerator& c, std::uint32_t bytes)
         {
-            using namespace asmjit;
+            using namespace Xbyak::util;
 
             if (bytes == 4)
             {
-                a.sub(x86::esp, 4);
-                a.movss(x86::dword_ptr(x86::esp), x86::xmm0);
-                a.fld(x86::dword_ptr(x86::esp));
-                a.add(x86::esp, 4);
+                c.sub(esp, 4);
+                c.movss(dword[esp], xmm0);
+                c.fld(dword[esp]);
+                c.add(esp, 4);
                 return;
             }
 
             if (bytes == 8)
             {
-                a.sub(x86::esp, 8);
-                a.movsd(x86::qword_ptr(x86::esp), x86::xmm0);
-                a.fld(x86::qword_ptr(x86::esp));
-                a.add(x86::esp, 8);
+                c.sub(esp, 8);
+                c.movsd(qword[esp], xmm0);
+                c.fld(qword[esp]);
+                c.add(esp, 8);
                 return;
             }
 
             throw std::runtime_error("UserCaller: unsupported xmm0 return size.");
         }
 
-        void emit_bridge_st0_to_xmm0(
-            asmjit::x86::Assembler& a,
-            std::uint32_t bytes
-        )
+        void emit_bridge_st0_to_xmm0(Xbyak::CodeGenerator& c, std::uint32_t bytes)
         {
-            using namespace asmjit;
+            using namespace Xbyak::util;
 
             if (bytes == 4)
             {
-                a.sub(x86::esp, 4);
-                a.fstp(x86::dword_ptr(x86::esp));
-                a.movss(x86::xmm0, x86::dword_ptr(x86::esp));
-                a.add(x86::esp, 4);
+                c.sub(esp, 4);
+                c.fstp(dword[esp]);
+                c.movss(xmm0, dword[esp]);
+                c.add(esp, 4);
                 return;
             }
 
             if (bytes == 8)
             {
-                a.sub(x86::esp, 8);
-                a.fstp(x86::qword_ptr(x86::esp));
-                a.movsd(x86::xmm0, x86::qword_ptr(x86::esp));
-                a.add(x86::esp, 8);
+                c.sub(esp, 8);
+                c.fstp(qword[esp]);
+                c.movsd(xmm0, qword[esp]);
+                c.add(esp, 8);
                 return;
             }
 
@@ -302,13 +332,13 @@ namespace uc::detail
         }
 
         void emit_push_callback_arg(
-            asmjit::x86::Assembler& a,
+            Xbyak::CodeGenerator& c,
             const abi_desc& desc,
             const std::vector<std::uint32_t>& incoming_offsets,
             std::size_t index
         )
         {
-            using namespace asmjit;
+            using namespace Xbyak::util;
 
             const auto& arg = desc.args[index];
 
@@ -318,15 +348,14 @@ namespace uc::detail
 
                 if (arg.bytes == 4)
                 {
-                    a.push(x86::dword_ptr(x86::ebp, static_cast<int>(offset)));
+                    c.push(dword[ebp + static_cast<int>(offset)]);
                     return;
                 }
 
                 if (arg.bytes == 8)
                 {
-                    // Push high then low for normal x86 cdecl layout.
-                    a.push(x86::dword_ptr(x86::ebp, static_cast<int>(offset + 4)));
-                    a.push(x86::dword_ptr(x86::ebp, static_cast<int>(offset)));
+                    c.push(dword[ebp + static_cast<int>(offset + 4)]);
+                    c.push(dword[ebp + static_cast<int>(offset)]);
                     return;
                 }
 
@@ -335,68 +364,57 @@ namespace uc::detail
 
             if (is_xmm_loc(arg.where))
             {
-                emit_store_xmm_arg_on_stack(a, arg.where, arg.bytes);
+                emit_store_xmm_arg_on_stack(c, arg.where, arg.bytes);
                 return;
             }
 
             if (arg.bytes != 4)
                 throw std::runtime_error("UserCaller: callback GPR args must be 4 bytes in this version.");
 
-            a.push(gp_from_loc(arg.where));
+            c.push(gp_from_loc(arg.where));
         }
 
         void emit_thunk_body(
-            asmjit::x86::Assembler& a,
+            Xbyak::CodeGenerator& c,
             const abi_desc& desc,
             std::uintptr_t baked_target)
         {
-            using namespace asmjit;
+            using namespace Xbyak::util;
 
             const auto offsets = wrapper_arg_offsets(desc);
 
             const bool preserve_ebx = uses_register(desc, loc::ebx);
             const bool preserve_esi = uses_register(desc, loc::esi);
             const bool preserve_edi = uses_register(desc, loc::edi);
-
             const bool baked = !desc.runtime_target;
 
-            // Standard frame keeps wrapper arg offsets stable even after pushes.
-            a.push(x86::ebp);
-            a.mov(x86::ebp, x86::esp);
+            c.push(ebp);
+            c.mov(ebp, esp);
 
-            // For baked calls, keep the target in a local stack slot.
-            // This avoids clobbering eax/ecx/edx just to call the target.
-            //
-            // [ebp - 4] = target address
             if (baked)
             {
-                a.sub(x86::esp, 4);
-                a.mov(
-                    x86::dword_ptr(x86::ebp, -4),
-                    static_cast<std::uint32_t>(baked_target)
-                );
+                c.sub(esp, 4);
+                c.mov(dword[ebp - 4], static_cast<std::uint32_t>(baked_target));
             }
 
             if (preserve_ebx)
-                a.push(x86::ebx);
+                c.push(ebx);
 
             if (preserve_esi)
-                a.push(x86::esi);
+                c.push(esi);
 
             if (preserve_edi)
-                a.push(x86::edi);
+                c.push(edi);
 
-            // Push target stack args right-to-left.
             for (std::size_t i = desc.args.size(); i > 0; --i)
             {
                 const std::size_t index = i - 1;
                 const auto& arg = desc.args[index];
 
                 if (arg.where == loc::stack)
-                    emit_push_stack_arg(a, arg, offsets[index]);
+                    emit_push_stack_arg(c, arg, offsets[index]);
             }
 
-            // Load register args after stack pushes.
             for (std::size_t i = 0; i < desc.args.size(); ++i)
             {
                 const auto& arg = desc.args[i];
@@ -406,164 +424,114 @@ namespace uc::detail
 
                 if (is_xmm_loc(arg.where))
                 {
-                    emit_load_xmm_arg(a, arg.where, offsets[i], arg.bytes);
+                    emit_load_xmm_arg(c, arg.where, offsets[i], arg.bytes);
                     continue;
                 }
 
                 if (arg.bytes != 4)
                     throw std::runtime_error("UserCaller: GPR args must be 4 bytes in this version.");
 
-                a.mov(
-                    gp_from_loc(arg.where),
-                    x86::dword_ptr(x86::ebp, static_cast<int>(offsets[i]))
-                );
+                c.mov(gp_from_loc(arg.where), dword[ebp + static_cast<int>(offsets[i])]);
             }
 
             if (desc.runtime_target)
-            {
-                // Runtime invoker signature:
-                // ret __cdecl invoker(uintptr_t target, args...)
-                //
-                // [ebp + 8] = target
-                a.call(x86::dword_ptr(x86::ebp, 8));
-            }
+                c.call(dword[ebp + 8]);
             else
-            {
-                // Baked target lives at [ebp - 4].
-                a.call(x86::dword_ptr(x86::ebp, -4));
-            }
+                c.call(dword[ebp - 4]);
 
             const std::uint32_t stack_bytes = pushed_stack_bytes(desc);
 
             if (desc.cleanup_mode == cleanup::caller && stack_bytes != 0)
-                a.add(x86::esp, stack_bytes);
+                c.add(esp, stack_bytes);
 
             if (preserve_edi)
-                a.pop(x86::edi);
+                c.pop(edi);
 
             if (preserve_esi)
-                a.pop(x86::esi);
+                c.pop(esi);
 
             if (preserve_ebx)
-                a.pop(x86::ebx);
+                c.pop(ebx);
 
             if (desc.return_where == loc::xmm0)
-                emit_bridge_xmm0_to_st0(a, desc.return_bytes);
+                emit_bridge_xmm0_to_st0(c, desc.return_bytes);
 
-            // Removes baked local slot too, if it exists.
-            a.mov(x86::esp, x86::ebp);
-            a.pop(x86::ebp);
-            a.ret();
+            c.mov(esp, ebp);
+            c.pop(ebp);
+            c.ret();
         }
 
         void emit_callback_body(
-            asmjit::x86::Assembler& a,
+            Xbyak::CodeGenerator& c,
             const abi_desc& desc,
             std::uintptr_t callback_addr
         )
         {
-            using namespace asmjit;
+            using namespace Xbyak::util;
 
             const auto incoming_offsets = incoming_stack_arg_offsets(desc);
 
-            a.push(x86::ebp);
-            a.mov(x86::ebp, x86::esp);
+            c.push(ebp);
+            c.mov(ebp, esp);
 
-            // Store callback address in local slot so we do not need to steal eax/ecx/edx.
-            //
-            // [ebp - 4] = callback address
-            a.sub(x86::esp, 4);
-            a.mov(
-                x86::dword_ptr(x86::ebp, -4),
-                static_cast<std::uint32_t>(callback_addr)
-            );
+            c.sub(esp, 4);
+            c.mov(dword[ebp - 4], static_cast<std::uint32_t>(callback_addr));
 
-            // Normal C++ callback wants all args on stack.
-            // Push right-to-left.
             for (std::size_t i = desc.args.size(); i > 0; --i)
-            {
-                emit_push_callback_arg(a, desc, incoming_offsets, i - 1);
-            }
+                emit_push_callback_arg(c, desc, incoming_offsets, i - 1);
 
-            a.call(x86::dword_ptr(x86::ebp, -4));
+            c.call(dword[ebp - 4]);
 
             const std::uint32_t cb_bytes = callback_arg_bytes(desc);
 
             if (cb_bytes != 0)
-                a.add(x86::esp, cb_bytes);
+                c.add(esp, cb_bytes);
 
             if (desc.return_where == loc::xmm0)
-                emit_bridge_st0_to_xmm0(a, desc.return_bytes);
+                emit_bridge_st0_to_xmm0(c, desc.return_bytes);
 
-            // Preserve eax / edx:eax / st0 return naturally.
-            a.mov(x86::esp, x86::ebp);
-            a.pop(x86::ebp);
+            c.mov(esp, ebp);
+            c.pop(ebp);
 
             const std::uint32_t incoming_stack_bytes = pushed_stack_bytes(desc);
 
             if (desc.cleanup_mode == cleanup::callee && incoming_stack_bytes != 0)
-                a.ret(incoming_stack_bytes);
+                c.ret(incoming_stack_bytes);
             else
-                a.ret();
+                c.ret();
+        }
+
+        void* finalize_code(Xbyak::CodeGenerator& code)
+        {
+            try
+            {
+                code.ready();
+            }
+            catch (const std::exception& e)
+            {
+                throw std::runtime_error(std::string("UserCaller: Xbyak finalize failed: ") + e.what());
+            }
+
+            const std::size_t bytes = code.getSize();
+            void* fn = allocate_code(std::max<std::size_t>(bytes, 1));
+
+            std::memcpy(fn, code.getCode(), bytes);
+            FlushInstructionCache(GetCurrentProcess(), fn, bytes);
+            return fn;
         }
 
         void* build_code(const abi_desc& desc, std::uintptr_t baked_target)
         {
-            using namespace asmjit;
-
-            JitRuntime& rt = runtime();
-
-            CodeHolder code;
-            Error err = code.init(rt.environment(), rt.cpu_features());
-
-            if (err != Error::kOk)
-                throw_asmjit_error("CodeHolder::init failed", err);
-
-            x86::Assembler a(&code);
-
-            emit_thunk_body(a, desc, baked_target);
-
-            void* fn = nullptr;
-
-            {
-                std::lock_guard<std::mutex> lock(runtime_mutex());
-
-                err = rt.add(&fn, &code);
-            }
-
-            if (err != Error::kOk)
-                throw_asmjit_error("JitRuntime::add failed", err);
-
-            return fn;
+            Xbyak::CodeGenerator code(CodeScratchBytes);
+            emit_thunk_body(code, desc, baked_target);
+            return finalize_code(code);
         }
 
         void* build_callback_code(const abi_desc& desc, std::uintptr_t callback_addr)
         {
-            using namespace asmjit;
-
-            JitRuntime& rt = runtime();
-
-            CodeHolder code;
-            Error err = code.init(rt.environment(), rt.cpu_features());
-
-            if (err != Error::kOk)
-                throw_asmjit_error("CodeHolder::init failed", err);
-
-            x86::Assembler a(&code);
-
-            emit_callback_body(a, desc, callback_addr);
-
-            void* fn = nullptr;
-
-            {
-                std::lock_guard<std::mutex> lock(runtime_mutex());
-                err = rt.add(&fn, &code);
-            }
-
-            if (err != Error::kOk)
-                throw_asmjit_error("JitRuntime::add failed", err);
-
-            return fn;
+            Xbyak::CodeGenerator code(CodeScratchBytes);
+            emit_callback_body(code, desc, callback_addr);
+            return finalize_code(code);
         }
     }
 
@@ -577,8 +545,6 @@ namespace uc::detail
         if (!entry)
             return;
 
-        std::lock_guard<std::mutex> lock(runtime_mutex());
-        runtime().release(entry);
         entry = nullptr;
     }
 
