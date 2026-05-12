@@ -6,6 +6,11 @@
 
 #include "usercaller/usercaller.hpp"
 
+#if __has_include(<safetyhook.hpp>)
+#define UC_WITH_SAFETYHOOK 1
+#include "usercaller/safetyhook_inline.hpp"
+#endif
+
 template <typename Fn>
 std::uintptr_t addr_of(Fn fn)
 {
@@ -57,6 +62,44 @@ extern "C" __declspec(naked) int Target_Edx_Eax()
         ret
     }
 }
+
+#if defined(UC_WITH_SAFETYHOOK)
+using target_abi = uc::abi<
+    uc::eax_ret<int>,
+    uc::edx_arg<int>
+>;
+
+static uc::inline_hook<target_abi> g_Target_Edx_Eax_Hook;
+
+int __cdecl Hook_Target_Edx_Eax(int value)
+{
+    int og = g_Target_Edx_Eax_Hook.call_original(value);
+    return og * 4;
+}
+
+void TestInlineHook()
+{
+    bool ok = g_Target_Edx_Eax_Hook.create(
+        reinterpret_cast<void*>(addr_of(&Target_Edx_Eax)),
+        &Hook_Target_Edx_Eax
+    );
+
+    print_pass("inline hook create", ok);
+
+    auto caller = target_abi::make_invoker();
+
+    int result = caller(addr_of(&Target_Edx_Eax), 7);
+
+    std::cout << "inline hook edx/eax result: "
+        << result
+        << " expected 56\n";
+
+    print_pass("inline hook edx/eax test", result == 56);
+    std::cout << '\n';
+
+    g_Target_Edx_Eax_Hook.reset();
+}
+#endif
 
 // int __usercall Target_Ecx_Esi_Stack@<eax>(
 //     int a@<ecx>,
@@ -435,6 +478,10 @@ int main()
         int result = fn(7);
         std::cout << "edx arg/eax ret: " << result << " expected 14\n\n";
     }
+
+#if defined(UC_WITH_SAFETYHOOK)
+    TestInlineHook();
+#endif
 
     {
         auto target = addr_of(&Target_Ecx_Esi_Stack);

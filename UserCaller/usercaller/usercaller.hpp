@@ -313,6 +313,8 @@ namespace uc
         using ret_t = typename RetSpec::type;
         using callback_fn_t = ret_t(UC_CDECL*)(typename ArgSpecs::type...);
 
+        callback() = default;
+
         explicit callback(callback_fn_t callback_fn)
         {
             auto desc = detail::make_desc<CleanupMode, false, RetSpec, ArgSpecs...>();
@@ -327,12 +329,12 @@ namespace uc
 
         void* raw() const noexcept
         {
-            return block_->entry;
+            return block_ ? block_->entry : nullptr;
         }
 
         std::uintptr_t address() const noexcept
         {
-            return reinterpret_cast<std::uintptr_t>(block_->entry);
+            return reinterpret_cast<std::uintptr_t>(raw());
         }
 
     private:
