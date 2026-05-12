@@ -1,0 +1,3 @@
+[submodule "UserCaller/external/asmjit"]
+	path = UserCaller/external/asmjit
+	url = https://github.com/asmjit/asmjit.git
