@@ -112,6 +112,7 @@ namespace uc
         };
 
         std::shared_ptr<code_block> build_baked(const abi_desc& desc, std::uintptr_t target);
+        std::shared_ptr<code_block> build_callback(const abi_desc& desc, std::uintptr_t callback);
         std::shared_ptr<code_block> build_invoker(const abi_desc& desc);
 
         template <typename T>
@@ -305,6 +306,55 @@ namespace uc
         return function<cleanup::callee, RetSpec, ArgSpecs...>(target);
     }
 
+    template <cleanup CleanupMode, typename RetSpec, typename... ArgSpecs>
+    class callback
+    {
+    public:
+        using ret_t = typename RetSpec::type;
+        using callback_fn_t = ret_t(UC_CDECL*)(typename ArgSpecs::type...);
+
+        explicit callback(callback_fn_t callback_fn)
+        {
+            auto desc = detail::make_desc<CleanupMode, false, RetSpec, ArgSpecs...>();
+            block_ = detail::build_callback(desc, reinterpret_cast<std::uintptr_t>(callback_fn));
+        }
+
+        callback(const callback&) = default;
+        callback& operator=(const callback&) = default;
+
+        callback(callback&&) noexcept = default;
+        callback& operator=(callback&&) noexcept = default;
+
+        void* raw() const noexcept
+        {
+            return block_->entry;
+        }
+
+        std::uintptr_t address() const noexcept
+        {
+            return reinterpret_cast<std::uintptr_t>(block_->entry);
+        }
+
+    private:
+        std::shared_ptr<detail::code_block> block_{};
+    };
+
+    template <typename RetSpec, typename... ArgSpecs>
+    auto make_callback(
+        typename callback<cleanup::caller, RetSpec, ArgSpecs...>::callback_fn_t callback_fn
+    )
+    {
+        return callback<cleanup::caller, RetSpec, ArgSpecs...>(callback_fn);
+    }
+
+    template <typename RetSpec, typename... ArgSpecs>
+    auto make_callback_callee(
+        typename callback<cleanup::callee, RetSpec, ArgSpecs...>::callback_fn_t callback_fn
+    )
+    {
+        return callback<cleanup::callee, RetSpec, ArgSpecs...>(callback_fn);
+    }
+
     template <typename RetSpec, typename... ArgSpecs>
     auto make_invoker()
     {
@@ -315,5 +365,12 @@ namespace uc
     auto make_invoker_callee()
     {
         return detail::invoker_cache<cleanup::callee, RetSpec, ArgSpecs...>::get();
+    }
+
+    void patch_call(void* call_site, void* new_target);
+
+    inline void patch_call(std::uintptr_t call_site, void* new_target)
+    {
+        patch_call(reinterpret_cast<void*>(call_site), new_target);
     }
 }
