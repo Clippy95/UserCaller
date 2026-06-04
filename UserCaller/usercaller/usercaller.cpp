@@ -21,7 +21,7 @@ namespace uc::detail
         {
             executable_page()
                 : base(static_cast<std::uint8_t*>(
-                    VirtualAlloc(nullptr, CodePageBytes, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+                    VirtualAlloc(nullptr, CodePageBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
                 ))
             {
                 if (!base)
@@ -37,7 +37,19 @@ namespace uc::detail
             executable_page(const executable_page&) = delete;
             executable_page& operator=(const executable_page&) = delete;
 
-            std::uint8_t* allocate(std::size_t bytes)
+            bool make_writable()
+            {
+                DWORD old_protect{};
+                return VirtualProtect(base, CodePageBytes, PAGE_READWRITE, &old_protect) != 0;
+            }
+
+            bool make_executable()
+            {
+                DWORD old_protect{};
+                return VirtualProtect(base, CodePageBytes, PAGE_EXECUTE_READ, &old_protect) != 0;
+            }
+
+            std::uint8_t* reserve(std::size_t bytes)
             {
                 const std::size_t aligned_offset =
                     (used + CodeAlignBytes - 1) & ~(CodeAlignBytes - 1);
@@ -66,24 +78,31 @@ namespace uc::detail
             return pages;
         }
 
-        void* allocate_code(std::size_t bytes)
+        struct code_allocation
+        {
+            executable_page* page{};
+            void* ptr{};
+        };
+
+        code_allocation reserve_code(std::size_t bytes)
         {
             std::lock_guard<std::mutex> lock(runtime_mutex());
 
             for (const auto& page : code_pages())
             {
-                if (void* p = page->allocate(bytes))
-                    return p;
+                if (void* p = page->reserve(bytes))
+                    return { page.get(), p };
             }
 
             auto page = std::make_unique<executable_page>();
-            void* p = page->allocate(bytes);
+            void* p = page->reserve(bytes);
 
             if (!p)
                 throw std::runtime_error("UserCaller: generated code is larger than one executable code page.");
 
+            executable_page* page_ptr = page.get();
             code_pages().push_back(std::move(page));
-            return p;
+            return { page_ptr, p };
         }
 
         Xbyak::Reg32 gp_from_loc(loc where)
@@ -512,11 +531,18 @@ namespace uc::detail
             }
 
             const std::size_t bytes = code.getSize();
-            void* fn = allocate_code(std::max<std::size_t>(bytes, 1));
+            const auto allocation = reserve_code(std::max<std::size_t>(bytes, 1));
 
-            std::memcpy(fn, code.getCode(), bytes);
-            FlushInstructionCache(GetCurrentProcess(), fn, bytes);
-            return fn;
+            if (!allocation.page->make_writable())
+                throw std::runtime_error("UserCaller: VirtualProtect failed making code page writable.");
+
+            std::memcpy(allocation.ptr, code.getCode(), bytes);
+
+            if (!allocation.page->make_executable())
+                throw std::runtime_error("UserCaller: VirtualProtect failed making code page executable.");
+
+            FlushInstructionCache(GetCurrentProcess(), allocation.ptr, bytes);
+            return allocation.ptr;
         }
 
         void* build_code(const abi_desc& desc, std::uintptr_t baked_target)
